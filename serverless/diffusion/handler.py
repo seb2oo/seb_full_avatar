@@ -1,0 +1,1018 @@
+import os
+import argparse
+import base64
+import logging
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+import boto3
+from botocore.config import Config
+import runpod
+import torch
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    force=True,
+)
+
+
+logger = logging.getLogger("musetalk")
+
+warmup_time = time.perf_counter()
+
+
+TESTS_IN_DOCKER = False
+
+if TESTS_IN_DOCKER:
+    USE_CACHE_MODEL = False
+else:
+    USE_CACHE_MODEL = True
+
+
+PROJECT_DIR = Path("/workspace/MuseTalk")
+MODELS_DIR = PROJECT_DIR / "models"
+
+HF_CACHE_DIR = Path(
+    "/runpod-volume/huggingface-cache/hub"
+)
+
+MUSE_TALK_MODEL_ID = "TMElyralab/MuseTalk"
+
+unet_config = str(MODELS_DIR / "musetalkV15" / "musetalk" / "musetalk.json")
+unet_model_path = str(MODELS_DIR / "musetalkV15" / "musetalk" / "pytorch_model.bin")
+
+
+logger.info("Starting MuseTalk worker")
+logger.info("Project directory:")
+logger.info(f"  {PROJECT_DIR}")
+logger.info("Models directory:")
+logger.info(f"  {MODELS_DIR}")
+
+
+
+def run_command(command):
+    logger.debug(f"[COMMAND] {command}")
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        logger.error(f"[COMMAND ERROR] {result.stderr.strip()[-4000:]}")
+        raise subprocess.CalledProcessError(
+            result.returncode,
+            command,
+            stderr=result.stderr,
+        )
+
+
+
+# ============================================================
+# Persistent model cache
+#
+# Persistent volume:
+#   /runpod-volume/models
+#
+# Local working models:
+#   /workspace/MuseTalk/models
+#
+# Models are COPIED from the persistent volume to the local
+# worker storage. No symlinks are used. (much faszer )
+# ============================================================
+
+CACHE_MODELS_DIR = Path("/runpod-volume/models")
+
+CACHE_MODELS_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+
+def copy_model_from_cache(
+    cache_file: Path,
+    local_file: Path,
+):
+    """
+    Copy a model from the persistent RunPod volume
+    to the local worker storage.
+
+    If the local file already exists, nothing is copied.
+    """
+
+    if local_file.exists():
+        logger.info(
+            f"[Cache] Local file already exists: "
+            f"{local_file}"
+        )
+        return
+
+    if not cache_file.exists():
+        raise FileNotFoundError(
+            f"Cached model not found: {cache_file}"
+        )
+
+    local_file.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    logger.info(
+        f"[Cache] Copying:\n"
+        f"        {cache_file}\n"
+        f"        -> {local_file}"
+    )
+
+    shutil.copy2(
+        cache_file,
+        local_file,
+    )
+
+    logger.info(
+        f"[Cache] Copy completed: {local_file}"
+    )
+
+
+def download_if_missing(
+    cache_file: Path,
+    command: list,
+):
+    """
+    Download a model into the persistent volume only
+    when it is not already cached.
+    """
+
+    if cache_file.exists():
+        logger.info(
+            f"[Cache] Already cached: {cache_file}"
+        )
+        return
+
+    logger.info(
+        f"[Cache] Downloading: {cache_file.name}"
+    )
+
+    run_command(command)
+
+    if not cache_file.exists():
+        raise RuntimeError(
+            f"Download completed but file was not found: "
+            f"{cache_file}"
+        )
+
+
+def copy_directory_from_cache(
+    cache_dir: Path,
+    local_dir: Path,
+    files: list,
+):
+    """
+    Copy selected model files from persistent cache
+    to the local model directory.
+    """
+
+    local_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    for filename in files:
+
+        cache_file = cache_dir / filename
+        local_file = local_dir / filename
+
+        copy_model_from_cache(
+            cache_file,
+            local_file,
+        )
+
+
+def upload_download_model():
+
+    # ============================================================
+    # SD VAE
+    # ============================================================
+
+    logger.info("Preparing SD VAE")
+
+    SD_VAE_DIR = MODELS_DIR / "sd-vae"
+    SD_VAE_CACHE = CACHE_MODELS_DIR / "sd-vae"
+
+    SD_VAE_CACHE.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    SD_VAE_FILES = [
+        "config.json",
+        "diffusion_pytorch_model.bin",
+    ]
+
+    # ------------------------------------------------------------
+    # Download to persistent volume if necessary
+    # ------------------------------------------------------------
+
+    for filename in SD_VAE_FILES:
+
+        cache_file = (
+            SD_VAE_CACHE / filename
+        )
+
+        download_if_missing(
+            cache_file,
+            [
+                "huggingface-cli",
+                "download",
+                "stabilityai/sd-vae-ft-mse",
+                filename,
+                "--local-dir",
+                str(SD_VAE_CACHE),
+            ],
+        )
+
+    # ------------------------------------------------------------
+    # Copy from persistent volume to local storage
+    # ------------------------------------------------------------
+
+    copy_directory_from_cache(
+        SD_VAE_CACHE,
+        SD_VAE_DIR,
+        SD_VAE_FILES,
+    )
+
+
+    # ============================================================
+    # Whisper
+    # ============================================================
+
+    logger.info("Preparing Whisper")
+
+    WHISPER_DIR = MODELS_DIR / "whisper"
+    WHISPER_CACHE = CACHE_MODELS_DIR / "whisper"
+
+    WHISPER_CACHE.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    WHISPER_FILES = [
+        "config.json",
+        "pytorch_model.bin",
+        "preprocessor_config.json",
+    ]
+
+    # ------------------------------------------------------------
+    # Download to persistent volume if necessary
+    # ------------------------------------------------------------
+
+    for filename in WHISPER_FILES:
+
+        cache_file = (
+            WHISPER_CACHE / filename
+        )
+
+        download_if_missing(
+            cache_file,
+            [
+                "huggingface-cli",
+                "download",
+                "openai/whisper-tiny",
+                filename,
+                "--local-dir",
+                str(WHISPER_CACHE),
+            ],
+        )
+
+    # ------------------------------------------------------------
+    # Copy from persistent volume to local storage
+    # ------------------------------------------------------------
+
+    copy_directory_from_cache(
+        WHISPER_CACHE,
+        WHISPER_DIR,
+        WHISPER_FILES,
+    )
+
+
+    # ============================================================
+    # DWPose
+    # ============================================================
+
+    logger.info("Preparing DWPose")
+
+    DWPOSE_DIR = MODELS_DIR / "dwpose"
+    DWPOSE_CACHE = CACHE_MODELS_DIR / "dwpose"
+
+    DWPOSE_CACHE.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    DWPOSE_FILE = (
+        DWPOSE_CACHE
+        / "dw-ll_ucoco_384.pth"
+    )
+
+    if DWPOSE_FILE.exists():
+
+        logger.info(
+            "[DWPose] Cached: dw-ll_ucoco_384.pth"
+        )
+
+    else:
+
+        logger.info(
+            "[DWPose] Downloading: dw-ll_ucoco_384.pth"
+        )
+
+        run_command([
+            "huggingface-cli",
+            "download",
+            "yzd-v/DWPose",
+            "--local-dir",
+            str(DWPOSE_CACHE),
+            "--include",
+            "dw-ll_ucoco_384.pth",
+        ])
+
+    # ------------------------------------------------------------
+    # Copy from persistent volume to local storage
+    # ------------------------------------------------------------
+
+    copy_model_from_cache(
+        DWPOSE_FILE,
+        DWPOSE_DIR / "dw-ll_ucoco_384.pth",
+    )
+
+
+    # ============================================================
+    # Face Parse BiSeNet
+    # ============================================================
+
+    logger.info("Preparing face-parse-bisent")
+
+    FACE_PARSE_DIR = (
+        MODELS_DIR / "face-parse-bisent"
+    )
+
+    FACE_PARSE_CACHE = (
+        CACHE_MODELS_DIR / "face-parse-bisent"
+    )
+
+    FACE_PARSE_CACHE.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    FACE_PARSE_FILES = [
+        "79999_iter.pth",
+        "resnet18-5c106cde.pth",
+    ]
+
+    # ------------------------------------------------------------
+    # Download to persistent volume if necessary
+    # ------------------------------------------------------------
+
+    for filename in FACE_PARSE_FILES:
+
+        cache_file = (
+            FACE_PARSE_CACHE / filename
+        )
+
+        download_if_missing(
+            cache_file,
+            [
+                "huggingface-cli",
+                "download",
+                "ManyOtherFunctions/face-parse-bisent",
+                filename,
+                "--local-dir",
+                str(FACE_PARSE_CACHE),
+            ],
+        )
+
+    # ------------------------------------------------------------
+    # Copy from persistent volume to local storage
+    # ------------------------------------------------------------
+
+    copy_directory_from_cache(
+        FACE_PARSE_CACHE,
+        FACE_PARSE_DIR,
+        FACE_PARSE_FILES,
+    )
+
+
+    # ============================================================
+    # S3FD
+    #
+    # Persistent cache:
+    #   /runpod-volume/torch-cache/checkpoints
+    #
+    # Local PyTorch cache:
+    #   /root/.cache/torch/hub/checkpoints
+    #
+    # No symlink.
+    # ============================================================
+
+    logger.info("Preparing S3FD")
+
+    S3FD_CACHE_DIR = (
+        Path("/runpod-volume/torch-cache")
+        / "checkpoints"
+    )
+
+    S3FD_CACHE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    S3FD_CACHE_PATH = (
+        S3FD_CACHE_DIR
+        / "s3fd-619a316812.pth"
+    )
+
+    # ------------------------------------------------------------
+    # Download to persistent volume if necessary
+    # ------------------------------------------------------------
+
+    if S3FD_CACHE_PATH.exists():
+
+        logger.info(
+            "[S3FD] Cached: s3fd-619a316812.pth"
+        )
+
+    else:
+
+        logger.info(
+            "[S3FD] Downloading: s3fd-619a316812.pth"
+        )
+
+        run_command([
+            "wget",
+            "-O",
+            str(S3FD_CACHE_PATH),
+            "https://huggingface.co/camenduru/facexlib/resolve/main/s3fd-619a316812.pth",
+        ])
+
+    # ------------------------------------------------------------
+    # Local PyTorch cache
+    # ------------------------------------------------------------
+
+    S3FD_LOCAL_DIR = Path(
+        "/root/.cache/torch/hub/checkpoints"
+    )
+
+    S3FD_LOCAL_FILE = (
+        S3FD_LOCAL_DIR
+        / "s3fd-619a316812.pth"
+    )
+
+    copy_model_from_cache(
+        S3FD_CACHE_PATH,
+        S3FD_LOCAL_FILE,
+    )
+
+
+    # ============================================================
+    # Done
+    # ============================================================
+
+    logger.info(
+        "Persistent model cache preparation completed"
+    )
+
+    logger.info(
+        f"Persistent models: {CACHE_MODELS_DIR}"
+    )
+
+    logger.info(
+        f"Local models: {MODELS_DIR}"
+    )
+
+
+def run_command2(command):
+    logger.debug(f"[COMMAND] {command}")
+
+    result = subprocess.run(
+        command,
+        shell=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        logger.error(f"[COMMAND ERROR] {result.stderr.strip()[-4000:]}")
+        raise subprocess.CalledProcessError(
+            result.returncode,
+            command,
+            stderr=result.stderr,
+        )
+
+
+def pull_git():
+    logger.info("Pulling MuseTalk repository")
+
+    run_command2(
+        f"cd '{PROJECT_DIR}' && git pull origin serverless"
+    )
+
+
+
+def upload_video_to_s3(video_path):
+    bucket = os.environ["S3_BUCKET"]
+    region = os.environ["S3_REGION"]
+    endpoint = os.environ["S3_ENDPOINT"]
+
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+        region_name=region,
+        endpoint_url=endpoint,
+        config=Config(signature_version="s3v4"),
+    )
+
+    key = f"musetalk/{os.path.basename(video_path)}"
+
+    s3.upload_file(
+        video_path,
+        bucket,
+        key,
+        ExtraArgs={
+            "ContentType": "video/mp4"
+        },
+    )
+
+    return key
+
+
+def find_cached_model(model_id):
+
+    org, name = model_id.split("/", 1)
+
+    model_dir = (
+        HF_CACHE_DIR
+        / f"models--{org}--{name}"
+    )
+
+    snapshots_dir = model_dir / "snapshots"
+
+    if not snapshots_dir.exists():
+        logger.fatal(f"HF cache not found: {snapshots_dir}")
+        raise RuntimeError(f"HF cache not found: {snapshots_dir}")
+
+    snapshots = [
+        p
+        for p in snapshots_dir.iterdir()
+        if p.is_dir()
+    ]
+
+    if not snapshots:
+        logger.fatal(f"No cached snapshot found for {model_id}")
+        raise RuntimeError(f"No cached snapshot found for {model_id}")
+
+    if len(snapshots) > 1:
+        logger.info(f"Found {len(snapshots)} cached snapshots.")
+
+    return snapshots[0]
+
+logger.debug("Looking up cached MuseTalk model")
+
+if USE_CACHE_MODEL :
+    MUSE_TALK_CACHE_PATH = find_cached_model(
+        MUSE_TALK_MODEL_ID
+    )
+
+    logger.info("MuseTalk cached model found:")
+    logger.info(MUSE_TALK_CACHE_PATH)
+
+
+def bootstrap():
+
+    global unet_config
+    global unet_model_path
+
+    logger.info("Starting MuseTalk bootstrap")
+
+
+    if not os.path.exists(
+        os.path.join(PROJECT_DIR, ".git")
+    ):
+
+        logger.info("MuseTalk repository not found.")
+
+        if os.path.exists(PROJECT_DIR):
+            logger.info(f"Removing incomplete directory: {PROJECT_DIR}")
+
+            run_command2(
+                f"rm -rf '{PROJECT_DIR}'"
+            )
+
+        logger.info("Cloning MuseTalk repository...")
+
+        run_command2(
+            "git clone -b serverless "
+            "https://github.com/seb2oo/MuseTalk.git "
+            f"'{PROJECT_DIR}'"
+        )
+
+    else:
+
+        logger.info("MuseTalk repository already exists.")
+
+
+    if str(PROJECT_DIR) not in sys.path:
+        sys.path.insert(0, str(PROJECT_DIR))
+
+
+    if USE_CACHE_MODEL:
+
+        logger.info(f"Using cached MuseTalk model from: {MUSE_TALK_CACHE_PATH}")
+
+
+        unet_config=str(
+        MUSE_TALK_CACHE_PATH
+        / "musetalk"
+        / "musetalk.json"
+        )
+
+        unet_model_path=str(
+            MUSE_TALK_CACHE_PATH
+            / "musetalk"
+            / "pytorch_model.bin"
+        )
+
+        logger.info(f"UNET CONFIG: {unet_config}")
+        logger.info(f"UNET CONFIG EXISTS: {os.path.exists(unet_config)}")
+
+        logger.info(f"UNET MODEL: {unet_model_path}")
+        logger.info(f"UNET MODEL EXISTS: {os.path.exists(unet_model_path)}")
+
+        logger.debug("Using MuseTalk model directly from the RunPod cache")
+    else:
+        logger.info("Downloading MuseTalk")
+
+        MUSE_TALK_DIR = MODELS_DIR / "musetalkV15"
+
+        run_command([
+            "huggingface-cli",
+            "download",
+            "TMElyralab/MuseTalk",
+            "--local-dir",
+            str(MUSE_TALK_DIR),
+        ])
+
+
+    upload_download_model()
+
+    logger.info("Model download completed")
+    logger.info("Models are located in:")
+    logger.info(f"  {MODELS_DIR}")
+
+logger.debug("Starting bootstrap")
+bootstrap()
+
+
+CACHE_SOURCE = "/workspace/avatar_cache"
+MUSE_TALK_PATH = "/workspace/MuseTalk"
+AVATAR_PATH = os.path.join(
+    MUSE_TALK_PATH,
+    "results",
+    "v15",
+    "avatars",
+    "avatar_1",
+)
+
+os.makedirs(AVATAR_PATH, exist_ok=True)
+
+for filename in ["avatar_cache.pt", "avatar_info.json"]:
+    src = os.path.join(CACHE_SOURCE, filename)
+    dst = os.path.join(AVATAR_PATH, filename)
+
+    if not os.path.exists(src):
+        logger.fatal(f"Missing avatar cache file: {src}")
+        raise FileNotFoundError(src)
+
+    shutil.copy2(src, dst)
+
+    logger.debug(
+        f"Copied {filename}: {os.path.getsize(dst) / (1024**2):.2f} MB"
+    )
+
+
+yaml_path = "/workspace/MuseTalk/configs/inference/realtime.yaml"
+
+with open(yaml_path, "r", encoding="utf-8") as f:
+    content = f.read()
+
+content = content.replace(
+    "preparation: True",
+    "preparation: False"
+)
+
+with open(yaml_path, "w", encoding="utf-8") as f:
+    f.write(content)
+
+logger.info("realtime.yaml: preparation set to False")
+
+
+os.chdir(PROJECT_DIR)
+from scripts import realtime_inference
+
+from scripts.realtime_inference import fast_check_ffmpeg
+from scripts.realtime_inference import load_all_model
+from scripts.realtime_inference import AudioProcessor
+from scripts.realtime_inference import WhisperModel
+from scripts.realtime_inference import FaceParsing
+from scripts.realtime_inference import OmegaConf
+from scripts.realtime_inference import Avatar
+
+
+realtime_inference.T0 = time.perf_counter()
+
+
+def log_time(message):
+    logger.debug(f"{message} | elapsed={time.perf_counter() - realtime_inference.T0:.3f}s")
+
+
+args = argparse.Namespace(
+    version="v15",
+    ffmpeg_path="./ffmpeg-4.4-amd64-static/",
+    gpu_id=0,
+    vae_type="sd-vae",
+
+
+    unet_config=unet_config,
+    unet_model_path = unet_model_path,
+    whisper_dir="./models/whisper",
+    inference_config="configs/inference/realtime.yaml",
+    bbox_shift=0,
+    result_dir="./results",
+    extra_margin=10,
+    fps=25,
+    audio_padding_length_left=2,
+    audio_padding_length_right=2,
+    batch_size=8,
+    output_vid_name=None,
+    use_saved_coord=False,
+    saved_coord=False,
+    parsing_mode="jaw",
+    left_cheek_width=90,
+    right_cheek_width=90,
+    skip_save_images=False,
+)
+
+realtime_inference.args = args
+
+
+if not fast_check_ffmpeg():
+    logger.debug("Adding ffmpeg to PATH")
+
+    path_separator = ';' if sys.platform == 'win32' else ':'
+    os.environ["PATH"] = f"{args.ffmpeg_path}{path_separator}{os.environ['PATH']}"
+    if not fast_check_ffmpeg():
+        logger.error("Unable to find ffmpeg after updating PATH")
+
+
+device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
+
+realtime_inference.device = device
+torch.backends.cudnn.benchmark = True
+log_time("Before model loading")    
+
+vae, unet, pe = load_all_model(
+    unet_model_path=args.unet_model_path,
+    vae_type=args.vae_type,
+    unet_config=args.unet_config,
+    device=device
+)
+
+realtime_inference.vae = vae
+realtime_inference.unet = unet
+realtime_inference.pe = pe
+timesteps = torch.tensor([0], device=device)
+
+realtime_inference.timesteps = timesteps
+log_time("After model loading")                     
+
+pe = pe.half().to(device)
+
+vae.vae = vae.vae.half().to(device)
+
+unet.model = unet.model.half().to(device)
+
+
+audio_processor = AudioProcessor(feature_extractor_path=args.whisper_dir)
+
+realtime_inference.audio_processor = audio_processor
+weight_dtype = unet.model.dtype
+
+realtime_inference.weight_dtype = weight_dtype
+whisper = WhisperModel.from_pretrained(args.whisper_dir)
+whisper = whisper.to(device=device, dtype=weight_dtype).eval()
+whisper.requires_grad_(False)
+
+realtime_inference.whisper = whisper
+log_time("After Whisper loading")    
+
+
+if args.version == "v15":
+    fp = FaceParsing(
+        left_cheek_width=args.left_cheek_width,
+        right_cheek_width=args.right_cheek_width
+    )
+else:      
+    fp = FaceParsing()
+
+
+realtime_inference.fp = fp
+
+inference_config = OmegaConf.load(args.inference_config)
+logger.debug(f"Inference config loaded from: {args.inference_config}")
+log_time("After inference config loading")    
+
+avatar_dir = PROJECT_DIR / "results" / "v15" / "avatars" / "avatar_1"
+
+logger.info(f"Avatar directory: {avatar_dir}")
+logger.info(f"Avatar directory exists: {avatar_dir.exists()}")
+logger.info(f"avatar_cache.pt exists: {(avatar_dir / 'avatar_cache.pt').exists()}")
+logger.info(f"avatar_info.json exists: {(avatar_dir / 'avatar_info.json').exists()}")
+
+
+for avatar_id in inference_config:
+    data_preparation = inference_config[avatar_id]["preparation"]
+    log_time("After avatar data preparation")
+
+    video_path = inference_config[avatar_id]["video_path"]
+    log_time("After reading avatar video path")
+
+    if args.version == "v15":
+        bbox_shift = 0
+    else:
+        bbox_shift = inference_config[avatar_id]["bbox_shift"]
+
+    avatar = Avatar(
+        avatar_id=avatar_id,
+        video_path=video_path,
+        bbox_shift=bbox_shift,
+        batch_size=args.batch_size,
+        preparation=data_preparation
+    )
+
+    log_time("After Avatar initialization")
+
+
+def handler(job):
+    """
+    Reçoit un job RunPod contenant le chemin de l'audio.
+    Tous les modèles et l'Avatar sont déjà chargés en mémoire.
+    """
+
+    job_input = job.get("input", {})
+
+    # ---------------------------------------------------------
+    # Warmup (value only valid for first startup ! it is just for information, debugging)
+    ## CAREFULL IS NOT REALLY THE WARMUP TIME BECAUSE WE DISCOVER INFERENCE STILL MAKE SOME LAZY WARMUP, ETC..
+    # ---------------------------------------------------------
+    warmup_requested = job_input.get("warmup", False)
+    if warmup_requested:
+        return {
+            "status": "warmup_completed",
+            "warmup_time" : (time.perf_counter()-warmup_time)
+        }
+
+
+    # ---------------------------------------------------------
+    # Optional Git pull
+    # ---------------------------------------------------------
+
+    pull_git_requested = job_input.get("pull_git", False)
+
+    ## ATTENTIO NEN FAIT C'EST PAS FONCTIONNEL CAR SI LE PROCESSUS EST DEJA CHARGE ALORS LE GIT PULL NE VA PAS REMPLACER LES INSTANCIATION..
+    if pull_git_requested:
+        logger.info("Git pull requested")
+
+        try:
+            pull_git()
+        except Exception:
+            logger.exception("Git pull failed")
+            raise
+
+        logger.info("Git pull completed successfully")
+
+        return {
+            "status": "git_pull_completed",
+            "repository": str(PROJECT_DIR),
+            "branch": "serverless",
+        }
+
+
+
+    any_shell_command = job_input.get("any_shell_command","")
+    if any_shell_command:
+        logger.debug(f"Running shell command: {any_shell_command}")
+
+        run_command2(any_shell_command)
+
+
+        return {
+            "status": "command_completed",
+            "command": any_shell_command,
+        }
+
+
+    audio_path = job_input.get("audio_path")
+    if not audio_path:
+        logger.error("Missing 'audio_path' in job input")
+        return {
+            "error": "Missing 'audio_path' in job input"
+        }
+
+    logger.info(f"Starting inference for {audio_path}")
+
+
+    audio_num = job_input.get("audio_num", "audio_1")
+
+
+    try:
+        avatar.inference(
+            audio_path,
+            audio_num,
+            args.fps,
+            args.skip_save_images
+        )
+    except Exception:
+        logger.exception(f"Inference failed for {audio_path}")
+        raise
+
+    log_time("After avatar inference")
+
+
+    output_path = f"/workspace/MuseTalk/results/v15/avatars/avatar_1/vid_output/{audio_num}.mp4"
+
+
+    if not os.path.exists(output_path):
+        logger.error(f"Video not found: {output_path}")
+        return {
+            "status": "error",
+            "message": f"Video not found: {output_path}"
+        }
+
+    ## too big create issue to expose it on the API directly
+    # with open(output_path, "rb") as f:
+    #     video_bytes = f.read()
+
+    # video_base64 = base64.b64encode(video_bytes).decode("utf-8")
+
+    video_size = os.path.getsize(output_path)
+
+    logger.info(f"Video generated successfully: {output_path}")
+    logger.info(f"Video size: {video_size / (1024 * 1024):.2f} MB")
+
+    # avec la première version de "upload_video_to_s3" qui ne fonctionnait pas
+    # video_url = upload_video_to_s3(output_path)
+
+    s3_key = upload_video_to_s3(output_path)
+    logger.info(f"Video uploaded to S3: {s3_key}")
+
+
+    return {
+        "status": "completed",
+        "audio_path": audio_path,
+        "audio_num": audio_num,
+    #   "video_base64": video_base64,
+        "video_path": output_path,
+        "video_size_bytes": video_size,
+        # "video_url": video_url,
+        "s3_bucket": os.environ["S3_BUCKET"],
+        "s3_key": s3_key,
+    }
+
+
+if not TESTS_IN_DOCKER:
+    if __name__ == "__main__":
+
+        runpod.serverless.start(
+            {
+                "handler": handler
+            }
+        )
+
+
+
+# exempled de commande a lancer étant donné que les commandeshell ne sont mnt plus polluées :
+
+# {
+#   "input": {
+#     "audio_path": "/workspace/MuseTalk/data/audio/seb_audio_fr.wav",
+#     "audio_num": "audio_1",
+#     "pull_git": false,
+#     "any_shell_command": "python -c \"import numba; print('NUMBA VERSION:', numba.__version__); print('DEBUG:', numba.config.DEBUG); print('DEBUG_FRONTEND:', numba.config.DEBUG_FRONTEND); print('DUMP_BYTECODE:', numba.config.DUMP_BYTECODE); print('DUMP_CFG:', numba.config.DUMP_CFG); print('DUMP_IR:', numba.config.DUMP_IR); print('DUMP_LLVM:', numba.config.DUMP_LLVM); print('DUMP_ASSEMBLY:', numba.config.DUMP_ASSEMBLY)\" >&2; exit 1",
+#     "warmup": false,
+#   }
+# }

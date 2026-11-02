@@ -1,0 +1,26 @@
+*
+
+!data/
+!fine_tuning/
+!js/
+!serverless/
+!docs/
+
+!data/# PROFIL DE SÉBASTIEN WERMUTH.enc
+!fine_tuning/examples.enc
+!js/avatar_sync.js
+!serverless/**
+!docs/**
+
+!.gitattributes
+!.gitignore
+!README.md
+!app.py
+!chat.py
+!log_retrieve.py
+!requirements.txt
+!de-100k.txt
+!en-80k.txt
+!es-100l.txt
+!fr-100k.txt
+!avatar_tag_pattern.py
